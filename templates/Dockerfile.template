@@ -1,0 +1,85 @@
+ARG BASE_IMG=ubuntu:24.04
+
+FROM ${BASE_IMG}
+
+WORKDIR /root
+
+# Update
+RUN apt update
+
+# =============================================================================
+# CUSTOM COMMANDS INSERTION POINT
+# =============================================================================
+# If you create a partial Dockerfile.custom (without FROM statement) in your
+# environment directory, its contents will be automatically inserted HERE.
+# This allows you to install environment-specific packages (like CUDA, Python
+# libraries, etc.) before the standard dev tools are installed.
+#
+# The custom commands run after the base image is set up but before SSH, git,
+# zsh, neovim, and other dev tools are installed.
+# =============================================================================
+
+# =============================================================================
+# SSH & Basic Env
+# =============================================================================
+
+RUN apt install -y openssh-client git
+
+# Add the Git provider's public key to known_hosts to avoid interactive prompts
+RUN mkdir -p -m 0600 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+RUN apt install -y \
+      zsh \
+      zoxide \
+      stow \
+      tmux
+
+# Set zsh as default shell for root user
+RUN chsh -s /bin/zsh root
+
+# =============================================================================
+# Tools
+# =============================================================================
+
+# Install Lazygit
+RUN LAZYGIT_VERSION=$(curl -s "https://api.github.com/repos/jesseduffield/lazygit/releases/latest" | \grep -Po '"tag_name": *"v\K[^"]*') && \
+curl -Lo lazygit.tar.gz "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_Linux_x86_64.tar.gz" && \
+tar xf lazygit.tar.gz lazygit && \
+install lazygit -D -t /usr/local/bin/
+
+# Install BOB Neovim Version Management
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN cargo install bob-nvim
+RUN bob install stable
+
+# Install neovim dependencies
+RUN apt install -y \
+      fzf \
+      ripgrep \
+      fd-find \
+      luarocks \
+      clang-format \
+      xclip \
+      nodejs \
+      npm \
+      black
+
+RUN npm install -g @fsouza/prettierd
+RUN npm install -g prettier
+
+# =============================================================================
+# Configs
+# =============================================================================
+
+ARG CACHE_BUSTER=1
+RUN echo "Busting Docker Cache with value: ${CACHE_BUSTER}"
+
+# Install dotfiles
+RUN --mount=type=ssh git clone --recursive git@github.com:mdavis36/configs.git dotfiles
+RUN cd dotfiles && \
+    stow --adopt zsh tmux git nvim && \
+    git restore .
+
+# Set default shell for container
+SHELL ["/bin/zsh", "-c"]

@@ -1,0 +1,39 @@
+services:
+  dev-env:
+    image: ${IMAGE_NAME}
+    hostname: ${CONTAINER_NAME}
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE_PATH:-dev-containers/templates/Dockerfile.template}
+      args:
+        - BASE_IMG=${BASE_IMG}
+        - CACHE_BUSTER=${CACHE_BUSTER:-1}
+      ssh:
+        - default
+
+    container_name: ${CONTAINER_NAME}
+    user: root
+
+    # Resource limits (can be overridden in environment config)
+    deploy:
+      resources:
+        limits:
+          cpus: '${CPU_LIMIT:-8.0}'
+          memory: ${MEMORY_LIMIT:-16G}
+
+    privileged: ${PRIVILEGED:-false}
+
+    volumes:
+      - ${SSH_AUTH_SOCK}:/ssh-agent
+      - .:/root/host-project
+      - dev-vol:/root/workspace
+
+    environment:
+      - SSH_AUTH_SOCK=/ssh-agent
+
+    command: sleep infinity
+    working_dir: /root/workspace
+
+volumes:
+  dev-vol:
+    external: true

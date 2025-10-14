@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+
+"""
+Container Management CLI for dev-containers framework
+Usage: container <command> [args]
+"""
+
+import os
+import sys
+import subprocess
+import argparse
+from pathlib import Path
+from typing import Optional, Dict
+import yaml
+
+
+class ContainerManager:
+    def __init__(self):
+        self.script_dir = Path(__file__).parent.resolve()
+        self.framework_root = self.script_dir.parent
+        self.project_root = self.framework_root.parent
+        self.config_dir = self.project_root / "container-config"
+        self.templates_dir = self.framework_root / "templates"
+
+    def load_environment_config(self, env_name: str) -> Dict[str, str]:
+        """Load environment configuration from config.env and shared/config.env"""
+        env_dir = self.config_dir / "environments" / env_name
+
+        if not env_dir.exists():
+            print(f"Error: Environment '{env_name}' not found")
+            sys.exit(1)
+
+        config = {}
+
+        # Load shared config first
+        shared_config = self.config_dir / "shared" / "config.env"
+        if shared_config.exists():
+            config.update(self._parse_env_file(shared_config))
+
+        # Load environment-specific config (overrides shared)
+        env_config = env_dir / "config.env"
+        if env_config.exists():
+            config.update(self._parse_env_file(env_config))
+        else:
+            print(f"Error: config.env not found in {env_dir}")
+            sys.exit(1)
+
+        # Set defaults
+        config.setdefault('CONTAINER_NAME', f"{env_name}-container")
+        config.setdefault('VOLUME_NAME', f"{env_name}-vol")
+        config.setdefault('IMAGE_NAME', f"{env_name}-image")
+        config.setdefault('CPU_LIMIT', '8.0')
+        config.setdefault('MEMORY_LIMIT', '16G')
+        config.setdefault('PRIVILEGED', 'false')
+
+        return config
+
+    def _parse_env_file(self, filepath: Path) -> Dict[str, str]:
+        """Parse a .env file and return key-value pairs"""
+        config = {}
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    # Remove quotes if present
+                    value = value.strip().strip('"').strip("'")
+                    config[key.strip()] = value
+        return config
+
+    def generate_compose_file(self, env_name: str, config: Dict[str, str]) -> Path:
+        """Generate docker-compose.yml from template with substitutions and merge overrides"""
+        template_path = self.templates_dir / "docker-compose.template.yml"
+        output_path = self.project_root / f".docker-compose.{env_name}.yml"
+
+        with open(template_path) as f:
+            content = f.read()
+
+        # Substitute environment variables
+        # Handle ${VAR:-default} syntax first - replace with just the value if we have it
+        import re
+        for key, value in config.items():
+            # Replace ${VAR:-default} with the value (removing the default part entirely)
+            content = re.sub(rf'\${{{re.escape(key)}:-[^}}]+}}', value, content)
+            # Replace plain ${VAR} with the value
+            content = content.replace(f"${{{key}}}", value)
+
+        # Load as YAML to merge with override if it exists
+        compose_data = yaml.safe_load(content)
+
+        # Check for compose override file
+        env_dir = self.config_dir / "environments" / env_name
+        override_path = env_dir / "compose.override.yml"
+
+        if override_path.exists():
+            with open(override_path) as f:
+                override_data = yaml.safe_load(f)
+
+            # Deep merge override into compose_data
+            compose_data = self._deep_merge(compose_data, override_data)
+
+        # Write final compose file
+        with open(output_path, 'w') as f:
+            yaml.dump(compose_data, f, default_flow_style=False, sort_keys=False)
+
+        return output_path
+
+    def _deep_merge(self, base: dict, override: dict) -> dict:
+        """Deep merge two dictionaries, with override taking precedence"""
+        result = base.copy()
+        for key, value in override.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    def get_dockerfile_path(self, env_name: str) -> str:
+        """Get or generate the Dockerfile path for the environment"""
+        env_dir = self.config_dir / "environments" / env_name
+        custom_dockerfile = env_dir / "Dockerfile.custom"
+
+        if custom_dockerfile.exists():
+            # Check if this is a partial dockerfile (just custom commands)
+            with open(custom_dockerfile) as f:
+                content = f.read()
+
+            # If it doesn't have FROM statement, it's a partial file
+            # We need to merge it with the template
+            if 'FROM' not in content:
+                merged_dockerfile = self.project_root / f".Dockerfile.{env_name}"
+                self._generate_merged_dockerfile(env_name, custom_dockerfile, merged_dockerfile)
+                return str(merged_dockerfile.relative_to(self.project_root))
+            else:
+                # It's a complete Dockerfile, use it as-is
+                return str(custom_dockerfile.relative_to(self.project_root))
+        else:
+            return str(self.templates_dir.relative_to(self.project_root) / "Dockerfile.template")
+
+    def _generate_merged_dockerfile(self, env_name: str, custom_file: Path, output_file: Path):
+        """Merge custom Dockerfile commands into the template"""
+        template_path = self.templates_dir / "Dockerfile.template"
+
+        with open(template_path) as f:
+            template_content = f.read()
+
+        with open(custom_file) as f:
+            custom_content = f.read()
+
+        # Find the insertion point (after base image setup, before SSH & Basic Env)
+        insertion_marker = "# ============================================================================="
+        ssh_section_marker = "# SSH & Basic Env"
+
+        # Split at the SSH section
+        parts = template_content.split(f"{insertion_marker}\n{ssh_section_marker}")
+
+        if len(parts) == 2:
+            # Insert custom commands after the ARG BASE_IMG and UPDATE section, before SSH setup
+            merged = (
+                parts[0].split("RUN apt update")[0] +
+                "RUN apt update\n\n" +
+                custom_content +
+                "\n\n" +
+                insertion_marker + "\n" + ssh_section_marker +
+                parts[1]
+            )
+        else:
+            # Fallback: just append custom content after base image
+            merged = template_content.replace(
+                "RUN apt update",
+                f"RUN apt update\n\n{custom_content}\n"
+            )
+
+        with open(output_file, 'w') as f:
+            f.write(merged)
+
+    def container_is_running(self, container_name: str) -> bool:
+        """Check if container is running"""
+        result = subprocess.run(
+            ["docker", "ps", "-q", "-f", f"name={container_name}"],
+            capture_output=True,
+            text=True
+        )
+        return bool(result.stdout.strip())
+
+    def container_exists(self, container_name: str) -> bool:
+        """Check if container exists (running or stopped)"""
+        result = subprocess.run(
+            ["docker", "ps", "-aq", "-f", f"name={container_name}"],
+            capture_output=True,
+            text=True
+        )
+        return bool(result.stdout.strip())
+
+    def cmd_list(self):
+        """List all available container environments"""
+        print("Available container environments:\n")
+
+        env_dir = self.config_dir / "environments"
+        if not env_dir.exists():
+            print(f"No environments found in {env_dir}")
+            return
+
+        for env_path in sorted(env_dir.iterdir()):
+            if env_path.is_dir():
+                env_name = env_path.name
+                config_file = env_path / "config.env"
+
+                if config_file.exists():
+                    config = self.load_environment_config(env_name)
+
+                    # Check container status
+                    container_name = config.get('CONTAINER_NAME', f"{env_name}-container")
+                    status = "running" if self.container_is_running(container_name) else "stopped"
+
+                    print(f"  {env_name}")
+                    print(f"    Base Image: {config.get('BASE_IMG', 'N/A')}")
+                    print(f"    Container:  {container_name} [{status}]")
+                    print()
+
+    def cmd_activate(self, env_name: str):
+        """Start and attach to a container environment"""
+        config = self.load_environment_config(env_name)
+        container_name = config['CONTAINER_NAME']
+
+        print(f"Activating {env_name} container...")
+
+        # Start SSH agent and add keys
+        try:
+            ssh_agent_output = subprocess.check_output(["ssh-agent", "-s"], text=True)
+            # Parse and set SSH_AUTH_SOCK and SSH_AGENT_PID
+            for line in ssh_agent_output.split('\n'):
+                if 'SSH_AUTH_SOCK' in line or 'SSH_AGENT_PID' in line:
+                    parts = line.split(';')[0].split('=')
+                    if len(parts) == 2:
+                        os.environ[parts[0]] = parts[1]
+
+            # Add SSH key
+            ssh_key = Path.home() / ".ssh" / "id_ed25519"
+            if ssh_key.exists():
+                subprocess.run(["ssh-add", str(ssh_key)], check=False)
+        except Exception as e:
+            print(f"Warning: Failed to setup SSH agent: {e}")
+
+        # Set environment variables for docker-compose
+        config['SSH_AUTH_SOCK'] = os.environ.get('SSH_AUTH_SOCK', '')
+        config['DOCKERFILE_PATH'] = self.get_dockerfile_path(env_name)
+        config['CACHE_BUSTER'] = str(subprocess.check_output(["date", "+%s"], text=True).strip())
+
+        # Generate docker-compose file
+        compose_file = self.generate_compose_file(env_name, config)
+
+        # Check container status and start if needed
+        if self.container_is_running(container_name):
+            print("Container is already running. Connecting...")
+        elif self.container_exists(container_name):
+            print("Starting existing container...")
+            subprocess.run(["docker", "start", container_name], check=True)
+        else:
+            print("Creating and starting new container...")
+            subprocess.run(
+                ["docker", "compose", "-f", str(compose_file), "build"],
+                cwd=self.project_root,
+                check=True
+            )
+            subprocess.run(
+                ["docker", "compose", "-f", str(compose_file), "-p", str(env_name), "up", "-d"],
+                cwd=self.project_root,
+                check=True
+            )
+            print("Container started successfully!")
+
+        print("Entering container shell...")
+        subprocess.run(["docker", "exec", "-it", container_name, "zsh"])
+
+    def cmd_deactivate(self, env_name: str):
+        """Stop a container environment"""
+        config = self.load_environment_config(env_name)
+        container_name = config['CONTAINER_NAME']
+
+        print(f"Stopping {container_name}...")
+
+        if not self.container_is_running(container_name):
+            print("Container is not running.")
+            return
+
+        subprocess.run(["docker", "stop", container_name], check=True)
+        print("Container stopped successfully!")
+
+    def cmd_exec(self, env_name: str, command: Optional[list] = None):
+        """Execute command in running container"""
+        config = self.load_environment_config(env_name)
+        container_name = config['CONTAINER_NAME']
+
+        if not self.container_is_running(container_name):
+            print(f"Error: Container {container_name} is not running")
+            print(f"Use 'container activate {env_name}' to start it")
+            sys.exit(1)
+
+        # Execute command or start shell
+        cmd = command if command else ["zsh"]
+        subprocess.run(["docker", "exec", "-it", container_name] + cmd)
+
+    def cmd_remove(self, env_name: str):
+        """Remove container and cleanup"""
+        config = self.load_environment_config(env_name)
+        container_name = config['CONTAINER_NAME']
+
+        print(f"Removing container {container_name}...")
+
+        # Stop container if running
+        if self.container_is_running(container_name):
+            subprocess.run(["docker", "stop", container_name], check=True)
+
+        # Remove container if exists
+        if self.container_exists(container_name):
+            subprocess.run(["docker", "rm", container_name], check=True)
+
+        # Remove generated compose file
+        compose_file = self.project_root / f".docker-compose.{env_name}.yml"
+        if compose_file.exists():
+            compose_file.unlink()
+
+        print("Container removed successfully!")
+
+    def cmd_logs(self, env_name: str, follow: bool = False, tail: Optional[str] = None):
+        """Show container logs"""
+        config = self.load_environment_config(env_name)
+        container_name = config['CONTAINER_NAME']
+
+        cmd = ["docker", "logs"]
+        if follow:
+            cmd.append("-f")
+        if tail:
+            cmd.extend(["--tail", tail])
+        cmd.append(container_name)
+
+        subprocess.run(cmd)
+
+
+def main():
+    manager = ContainerManager()
+
+    parser = argparse.ArgumentParser(
+        description="Container Management CLI for dev-containers framework",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+
+    # list command
+    subparsers.add_parser('list', help='List all available container environments')
+
+    # activate command
+    activate_parser = subparsers.add_parser('activate', help='Start and attach to a container environment')
+    activate_parser.add_argument('env_name', help='Environment name')
+
+    # deactivate command
+    deactivate_parser = subparsers.add_parser('deactivate', help='Stop a container environment')
+    deactivate_parser.add_argument('env_name', help='Environment name')
+
+    # exec command
+    exec_parser = subparsers.add_parser('exec', help='Execute command in running container')
+    exec_parser.add_argument('env_name', help='Environment name')
+    exec_parser.add_argument('command', nargs='*', help='Command to execute (default: zsh)')
+
+    # remove command
+    remove_parser = subparsers.add_parser('remove', help='Remove container and cleanup')
+    remove_parser.add_argument('env_name', help='Environment name')
+
+    # logs command
+    logs_parser = subparsers.add_parser('logs', help='Show container logs')
+    logs_parser.add_argument('env_name', help='Environment name')
+    logs_parser.add_argument('-f', '--follow', action='store_true', help='Follow log output')
+    logs_parser.add_argument('--tail', help='Number of lines to show from the end')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # Execute command
+    try:
+        if args.command == 'list':
+            manager.cmd_list()
+        elif args.command == 'activate':
+            manager.cmd_activate(args.env_name)
+        elif args.command == 'deactivate':
+            manager.cmd_deactivate(args.env_name)
+        elif args.command == 'exec':
+            manager.cmd_exec(args.env_name, args.command if args.command else None)
+        elif args.command == 'remove':
+            manager.cmd_remove(args.env_name)
+        elif args.command == 'logs':
+            manager.cmd_logs(args.env_name, args.follow, args.tail)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
