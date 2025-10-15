@@ -24,6 +24,7 @@ services:
     privileged: ${PRIVILEGED:-false}
 
     volumes:
+      - ~/.zprofile:/root/.zprofile
       - ${SSH_AUTH_SOCK}:/ssh-agent
       - .:/root/host-project
       - dev-vol:/root/workspace
