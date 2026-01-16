@@ -51,7 +51,7 @@ install lazygit -D -t /usr/local/bin/
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo install bob-nvim
-RUN bob install stable
+RUN bob install 0.11.4
 
 # Install neovim dependencies
 RUN apt install -y \
@@ -80,6 +80,9 @@ RUN --mount=type=ssh git clone --recursive git@github.com:mdavis36/configs.git d
 RUN cd dotfiles && \
     stow --adopt zsh tmux git nvim && \
     git restore .
+
+# Initialize and synv lazyvim plugins.
+RUN bob run 0.11.4 --headless "+Lazy! sync" +qa
 
 # Set default shell for container
 SHELL ["/bin/zsh", "-c"]
