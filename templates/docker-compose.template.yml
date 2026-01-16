@@ -26,8 +26,9 @@ services:
     volumes:
       - ~/.zprofile:/root/.zprofile
       - ${SSH_AUTH_SOCK}:/ssh-agent
-      - .:/root/host-project
+      - .:/root/host
       - dev-vol:/root/workspace
+      - claude-vol:/root/.claude/projects
 
     environment:
       - SSH_AUTH_SOCK=/ssh-agent
@@ -37,4 +38,6 @@ services:
 
 volumes:
   dev-vol:
+    external: true
+  claude-vol:
     external: true
