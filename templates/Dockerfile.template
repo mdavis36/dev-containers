@@ -19,6 +19,10 @@ RUN apt update
 # zsh, neovim, and other dev tools are installed.
 # =============================================================================
 
+RUN apt install -y clang-20 libstdc++-14-dev
+ENV CC=clang-20
+ENV CXX=clang++-20
+
 # =============================================================================
 # SSH & Basic Env
 # =============================================================================
@@ -81,8 +85,9 @@ RUN cd dotfiles && \
     stow --adopt zsh tmux git nvim && \
     git restore .
 
-# Initialize and synv lazyvim plugins.
-RUN bob run 0.11.4 --headless "+Lazy! sync" +qa
 
 # Set default shell for container
 SHELL ["/bin/zsh", "-c"]
+
+# Initialize and synv lazyvim plugins.
+RUN nvim --headless "+Lazy! sync" +qa
