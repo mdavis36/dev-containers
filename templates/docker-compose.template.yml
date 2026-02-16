@@ -29,7 +29,7 @@ services:
     volumes:
       - ~/.zprofile:/root/.zprofile # For PAT tokens mostly.
       - ${SSH_AUTH_SOCK}:/ssh-agent
-      - .:/root/host
+      - .:/host
       - dev-vol:/root/workspace
 
     environment:
