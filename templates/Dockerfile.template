@@ -19,10 +19,6 @@ RUN apt update
 # zsh, neovim, and other dev tools are installed.
 # =============================================================================
 
-RUN apt install -y clang-20 libstdc++-14-dev
-ENV CC=clang-20
-ENV CXX=clang++-20
-
 # =============================================================================
 # SSH & Basic Env
 # =============================================================================
@@ -46,7 +42,7 @@ RUN chsh -s /bin/zsh root
 # =============================================================================
 
 # Install Lazygit
-RUN LAZYGIT_VERSION=0.55.1 && \
+RUN LAZYGIT_VERSION=0.59.0 && \
 curl -Lo lazygit.tar.gz "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_Linux_x86_64.tar.gz" && \
 tar xf lazygit.tar.gz lazygit && \
 install lazygit -D -t /usr/local/bin/
@@ -91,3 +87,12 @@ SHELL ["/bin/zsh", "-c"]
 
 # Initialize and synv lazyvim plugins.
 RUN nvim --headless "+Lazy! sync" +qa
+
+# =============================================================================
+# POST-TEMPLATE COMMANDS INSERTION POINT
+# =============================================================================
+# If you create a Dockerfile.post (without FROM statement) in your environment
+# directory, its contents will be automatically appended HERE.
+# This allows you to install project-specific tools that depend on the standard
+# dev environment (cargo, npm, pip, etc.) already being available.
+# =============================================================================

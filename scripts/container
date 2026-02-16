@@ -22,8 +22,9 @@ class ContainerManager:
         self.config_dir = self.project_root / "container-config"
         self.templates_dir = self.framework_root / "templates"
 
-    def load_environment_config(self, env_name: str) -> Dict[str, str]:
-        """Load environment configuration from config.env and shared/config.env"""
+    def load_environment_config(self, env_name: str, instance_name: Optional[str] = None) -> Dict[str, str]:
+        """Load environment configuration from config.env and shared/config.env.
+        If instance_name is provided, override container/image names for a named instance."""
         env_dir = self.config_dir / "environments" / env_name
 
         if not env_dir.exists():
@@ -53,6 +54,11 @@ class ContainerManager:
         config.setdefault('MEMORY_LIMIT', '16G')
         config.setdefault('PRIVILEGED', 'false')
 
+        # Override names for named instances
+        if instance_name:
+            config['CONTAINER_NAME'] = f"{instance_name}-container"
+            config['IMAGE_NAME'] = f"{instance_name}-image"
+
         return config
 
     def _parse_env_file(self, filepath: Path) -> Dict[str, str]:
@@ -68,10 +74,11 @@ class ContainerManager:
                     config[key.strip()] = value
         return config
 
-    def generate_compose_file(self, env_name: str, config: Dict[str, str]) -> Path:
+    def generate_compose_file(self, env_name: str, config: Dict[str, str], instance_name: Optional[str] = None) -> Path:
         """Generate docker-compose.yml from template with substitutions and merge overrides"""
+        file_label = instance_name or env_name
         template_path = self.templates_dir / "docker-compose.template.yml"
-        output_path = self.project_root / f".docker-compose.{env_name}.yml"
+        output_path = self.project_root / f".docker-compose.{file_label}.yml"
 
         with open(template_path) as f:
             content = f.read()
@@ -115,61 +122,105 @@ class ContainerManager:
                 result[key] = value
         return result
 
-    def get_dockerfile_path(self, env_name: str) -> str:
+    def get_dockerfile_path(self, env_name: str, instance_name: Optional[str] = None) -> str:
         """Get or generate the Dockerfile path for the environment"""
+        file_label = instance_name or env_name
         env_dir = self.config_dir / "environments" / env_name
         custom_dockerfile = env_dir / "Dockerfile.custom"
+        post_dockerfile = env_dir / "Dockerfile.post"
 
-        if custom_dockerfile.exists():
+        has_custom = custom_dockerfile.exists()
+        has_post = post_dockerfile.exists()
+
+        if has_custom:
             # Check if this is a partial dockerfile (just custom commands)
             with open(custom_dockerfile) as f:
                 content = f.read()
 
-            # If it doesn't have FROM statement, it's a partial file
-            # We need to merge it with the template
-            if 'FROM' not in content:
-                merged_dockerfile = self.project_root / f".Dockerfile.{env_name}"
-                self._generate_merged_dockerfile(env_name, custom_dockerfile, merged_dockerfile)
-                return str(merged_dockerfile.relative_to(self.project_root))
-            else:
-                # It's a complete Dockerfile, use it as-is
+            # If it has a FROM statement, it's a complete Dockerfile
+            if 'FROM' in content:
+                # Complete Dockerfile - use as-is (Dockerfile.post is ignored)
                 return str(custom_dockerfile.relative_to(self.project_root))
+
+        # If either partial custom or post file exists, generate a merged Dockerfile
+        if has_custom or has_post:
+            merged_dockerfile = self.project_root / f".Dockerfile.{file_label}"
+            self._generate_merged_dockerfile(
+                env_name,
+                custom_file=custom_dockerfile if has_custom else None,
+                post_file=post_dockerfile if has_post else None,
+                output_file=merged_dockerfile,
+            )
+            return str(merged_dockerfile.relative_to(self.project_root))
         else:
             return str(self.templates_dir.relative_to(self.project_root) / "Dockerfile.template")
 
-    def _generate_merged_dockerfile(self, env_name: str, custom_file: Path, output_file: Path):
+    def _generate_merged_dockerfile(self, env_name: str, custom_file: Optional[Path], post_file: Optional[Path], output_file: Path):
         """Merge custom Dockerfile commands into the template"""
         template_path = self.templates_dir / "Dockerfile.template"
 
         with open(template_path) as f:
             template_content = f.read()
 
-        with open(custom_file) as f:
-            custom_content = f.read()
+        custom_content = ""
+        if custom_file:
+            with open(custom_file) as f:
+                custom_content = f.read()
 
-        # Find the insertion point (after base image setup, before SSH & Basic Env)
-        insertion_marker = "# ============================================================================="
-        ssh_section_marker = "# SSH & Basic Env"
+        post_content = ""
+        if post_file:
+            with open(post_file) as f:
+                post_content = f.read()
 
-        # Split at the SSH section
-        parts = template_content.split(f"{insertion_marker}\n{ssh_section_marker}")
+        merged = template_content
 
-        if len(parts) == 2:
-            # Insert custom commands after the ARG BASE_IMG and UPDATE section, before SSH setup
-            merged = (
-                parts[0].split("RUN apt update")[0] +
-                "RUN apt update\n\n" +
-                custom_content +
-                "\n\n" +
-                insertion_marker + "\n" + ssh_section_marker +
-                parts[1]
-            )
-        else:
-            # Fallback: just append custom content after base image
-            merged = template_content.replace(
-                "RUN apt update",
-                f"RUN apt update\n\n{custom_content}\n"
-            )
+        # Insert pre-template custom commands (Dockerfile.custom)
+        if custom_content:
+            insertion_marker = "# ============================================================================="
+            ssh_section_marker = "# SSH & Basic Env"
+
+            parts = merged.split(f"{insertion_marker}\n{ssh_section_marker}")
+
+            if len(parts) == 2:
+                merged = (
+                    parts[0].split("RUN apt update")[0] +
+                    "RUN apt update\n\n" +
+                    custom_content +
+                    "\n\n" +
+                    insertion_marker + "\n" + ssh_section_marker +
+                    parts[1]
+                )
+            else:
+                merged = merged.replace(
+                    "RUN apt update",
+                    f"RUN apt update\n\n{custom_content}\n"
+                )
+
+        # Append post-template commands (Dockerfile.post)
+        if post_content:
+            post_marker = "# POST-TEMPLATE COMMANDS INSERTION POINT"
+            insertion_marker = "# ============================================================================="
+
+            parts = merged.split(f"{insertion_marker}\n{post_marker}")
+
+            if len(parts) == 2:
+                # Find the end of the comment block after the marker
+                remaining = parts[1]
+                # The comment block ends after the closing separator line
+                closing_sep = remaining.find(f"{insertion_marker}")
+                if closing_sep != -1:
+                    after_block = remaining[closing_sep + len(insertion_marker):]
+                    merged = (
+                        parts[0] +
+                        insertion_marker + "\n" + post_marker +
+                        remaining[:closing_sep + len(insertion_marker)] +
+                        "\n\n" + post_content +
+                        after_block
+                    )
+                else:
+                    merged = merged.rstrip() + "\n\n" + post_content + "\n"
+            else:
+                merged = merged.rstrip() + "\n\n" + post_content + "\n"
 
         with open(output_file, 'w') as f:
             f.write(merged)
@@ -216,14 +267,39 @@ class ContainerManager:
                     print(f"  {env_name}")
                     print(f"    Base Image: {config.get('BASE_IMG', 'N/A')}")
                     print(f"    Container:  {container_name} [{status}]")
+
+                    # Find named instances by looking for running/existing containers
+                    # that match the pattern <name>-container where the env config was used
+                    self._list_named_instances(env_name)
+
                     print()
 
-    def cmd_activate(self, env_name: str):
-        """Start and attach to a container environment"""
-        config = self.load_environment_config(env_name)
-        container_name = config['CONTAINER_NAME']
+    def _list_named_instances(self, env_name: str):
+        """List any named instances spawned from this environment"""
+        # Look for generated compose files matching this environment's instances
+        for compose_file in sorted(self.project_root.glob(f".docker-compose.*.yml")):
+            instance_label = compose_file.stem.replace(".docker-compose.", "")
+            if instance_label == env_name:
+                continue  # Skip the base environment
+            # Check if this compose file references the same environment by reading it
+            try:
+                with open(compose_file) as f:
+                    data = yaml.safe_load(f)
+                service = data.get('services', {}).get('dev-env', {})
+                cname = service.get('container_name', '')
+                if cname == f"{instance_label}-container":
+                    status = "running" if self.container_is_running(cname) else "stopped"
+                    print(f"    Instance:   {instance_label} ({cname}) [{status}]")
+            except Exception:
+                pass
 
-        print(f"Activating {env_name} container...")
+    def cmd_activate(self, env_name: str, instance_name: Optional[str] = None):
+        """Start and attach to a container environment"""
+        config = self.load_environment_config(env_name, instance_name)
+        container_name = config['CONTAINER_NAME']
+        file_label = instance_name or env_name
+
+        print(f"Activating {file_label} container (env: {env_name})...")
 
         # Start SSH agent and add keys
         try:
@@ -244,11 +320,11 @@ class ContainerManager:
 
         # Set environment variables for docker-compose
         config['SSH_AUTH_SOCK'] = os.environ.get('SSH_AUTH_SOCK', '')
-        config['DOCKERFILE_PATH'] = self.get_dockerfile_path(env_name)
+        config['DOCKERFILE_PATH'] = self.get_dockerfile_path(env_name, instance_name)
         config['CACHE_BUSTER'] = str(subprocess.check_output(["date", "+%s"], text=True).strip())
 
         # Generate docker-compose file
-        compose_file = self.generate_compose_file(env_name, config)
+        compose_file = self.generate_compose_file(env_name, config, instance_name)
 
         # Check container status and start if needed
         if self.container_is_running(container_name):
@@ -264,7 +340,7 @@ class ContainerManager:
                 check=True
             )
             subprocess.run(
-                ["docker", "compose", "-f", str(compose_file), "-p", str(env_name), "up", "-d"],
+                ["docker", "compose", "-f", str(compose_file), "-p", file_label, "up", "-d"],
                 cwd=self.project_root,
                 check=True
             )
@@ -273,9 +349,9 @@ class ContainerManager:
         print("Entering container shell...")
         subprocess.run(["docker", "exec", "-it", container_name, "zsh"])
 
-    def cmd_deactivate(self, env_name: str):
+    def cmd_deactivate(self, env_name: str, instance_name: Optional[str] = None):
         """Stop a container environment"""
-        config = self.load_environment_config(env_name)
+        config = self.load_environment_config(env_name, instance_name)
         container_name = config['CONTAINER_NAME']
 
         print(f"Stopping {container_name}...")
@@ -287,23 +363,25 @@ class ContainerManager:
         subprocess.run(["docker", "stop", container_name], check=True)
         print("Container stopped successfully!")
 
-    def cmd_exec(self, env_name: str, command: Optional[list] = None):
+    def cmd_exec(self, env_name: str, command: Optional[list] = None, instance_name: Optional[str] = None):
         """Execute command in running container"""
-        config = self.load_environment_config(env_name)
+        config = self.load_environment_config(env_name, instance_name)
         container_name = config['CONTAINER_NAME']
 
         if not self.container_is_running(container_name):
             print(f"Error: Container {container_name} is not running")
-            print(f"Use 'container activate {env_name}' to start it")
+            name_hint = f" --name {instance_name}" if instance_name else ""
+            print(f"Use 'container activate {env_name}{name_hint}' to start it")
             sys.exit(1)
 
         # Execute command or start shell
         cmd = command if command else ["zsh"]
         subprocess.run(["docker", "exec", "-it", container_name] + cmd)
 
-    def cmd_remove(self, env_name: str):
+    def cmd_remove(self, env_name: str, instance_name: Optional[str] = None):
         """Remove container and cleanup"""
-        config = self.load_environment_config(env_name)
+        file_label = instance_name or env_name
+        config = self.load_environment_config(env_name, instance_name)
         container_name = config['CONTAINER_NAME']
 
         print(f"Removing container {container_name}...")
@@ -317,15 +395,20 @@ class ContainerManager:
             subprocess.run(["docker", "rm", container_name], check=True)
 
         # Remove generated compose file
-        compose_file = self.project_root / f".docker-compose.{env_name}.yml"
+        compose_file = self.project_root / f".docker-compose.{file_label}.yml"
         if compose_file.exists():
             compose_file.unlink()
 
+        # Remove generated Dockerfile if any
+        dockerfile = self.project_root / f".Dockerfile.{file_label}"
+        if dockerfile.exists():
+            dockerfile.unlink()
+
         print("Container removed successfully!")
 
-    def cmd_logs(self, env_name: str, follow: bool = False, tail: Optional[str] = None):
+    def cmd_logs(self, env_name: str, follow: bool = False, tail: Optional[str] = None, instance_name: Optional[str] = None):
         """Show container logs"""
-        config = self.load_environment_config(env_name)
+        config = self.load_environment_config(env_name, instance_name)
         container_name = config['CONTAINER_NAME']
 
         cmd = ["docker", "logs"]
@@ -354,23 +437,28 @@ def main():
     # activate command
     activate_parser = subparsers.add_parser('activate', help='Start and attach to a container environment')
     activate_parser.add_argument('env_name', help='Environment name')
+    activate_parser.add_argument('--name', dest='instance_name', help='Custom instance name (creates a separate container from the same environment)')
 
     # deactivate command
     deactivate_parser = subparsers.add_parser('deactivate', help='Stop a container environment')
     deactivate_parser.add_argument('env_name', help='Environment name')
+    deactivate_parser.add_argument('--name', dest='instance_name', help='Custom instance name')
 
     # exec command
     exec_parser = subparsers.add_parser('exec', help='Execute command in running container')
     exec_parser.add_argument('env_name', help='Environment name')
+    exec_parser.add_argument('--name', dest='instance_name', help='Custom instance name')
     exec_parser.add_argument('command', nargs='*', help='Command to execute (default: zsh)')
 
     # remove command
     remove_parser = subparsers.add_parser('remove', help='Remove container and cleanup')
     remove_parser.add_argument('env_name', help='Environment name')
+    remove_parser.add_argument('--name', dest='instance_name', help='Custom instance name')
 
     # logs command
     logs_parser = subparsers.add_parser('logs', help='Show container logs')
     logs_parser.add_argument('env_name', help='Environment name')
+    logs_parser.add_argument('--name', dest='instance_name', help='Custom instance name')
     logs_parser.add_argument('-f', '--follow', action='store_true', help='Follow log output')
     logs_parser.add_argument('--tail', help='Number of lines to show from the end')
 
@@ -385,15 +473,15 @@ def main():
         if args.command == 'list':
             manager.cmd_list()
         elif args.command == 'activate':
-            manager.cmd_activate(args.env_name)
+            manager.cmd_activate(args.env_name, args.instance_name)
         elif args.command == 'deactivate':
-            manager.cmd_deactivate(args.env_name)
+            manager.cmd_deactivate(args.env_name, args.instance_name)
         elif args.command == 'exec':
-            manager.cmd_exec(args.env_name, args.command if args.command else None)
+            manager.cmd_exec(args.env_name, args.command if args.command else None, args.instance_name)
         elif args.command == 'remove':
-            manager.cmd_remove(args.env_name)
+            manager.cmd_remove(args.env_name, args.instance_name)
         elif args.command == 'logs':
-            manager.cmd_logs(args.env_name, args.follow, args.tail)
+            manager.cmd_logs(args.env_name, args.follow, args.tail, args.instance_name)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
         sys.exit(130)

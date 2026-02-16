@@ -38,7 +38,8 @@ your-project/
 │   ├── environments/
 │   │   ├── env1/
 │   │   │   ├── config.env
-│   │   │   ├── Dockerfile.custom  # Optional
+│   │   │   ├── Dockerfile.custom  # Optional: pre-template commands
+│   │   │   ├── Dockerfile.post    # Optional: post-template commands
 │   │   │   └── compose.override.yml  # Optional
 │   │   └── env2/
 │   │       └── config.env
@@ -100,7 +101,7 @@ Each environment requires a `config.env` file with these variables:
 
 ### Custom Dockerfile
 
-To add environment-specific packages, create `Dockerfile.custom` in your environment directory.
+To add environment-specific packages, create `Dockerfile.custom` and/or `Dockerfile.post` in your environment directory.
 
 **Option 1: Partial Dockerfile (Recommended - No Duplication)**
 
@@ -126,7 +127,20 @@ ENV PATH=/usr/local/cuda/bin:${PATH}
 RUN apt install -y python3-pip python3-dev
 ```
 
-**Option 2: Complete Dockerfile (Full Control)**
+**Option 2: Post-Template Commands (`Dockerfile.post`)**
+
+If you need to install project-specific tools that depend on the standard dev environment (cargo, npm, pip, etc.) already being available, create `Dockerfile.post`:
+
+```dockerfile
+# Installed after all standard tools (zsh, neovim, cargo, npm, etc.)
+RUN cargo install tree-sitter-cli
+RUN pip install torch numpy
+RUN npm install -g typescript
+```
+
+You can use both `Dockerfile.custom` and `Dockerfile.post` together — custom commands run early (before tools), post commands run at the end (after tools and configs).
+
+**Option 3: Complete Dockerfile (Full Control)**
 
 If you need complete control, include a `FROM` statement. The framework will use this file as-is:
 

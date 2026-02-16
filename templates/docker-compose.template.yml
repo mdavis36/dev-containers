@@ -1,5 +1,8 @@
 services:
   dev-env:
+    stdin_open: true  # Equivalent to -i flag in 'docker run'
+    tty: true         # Equivalent to -t flag in 'docker run'
+
     image: ${IMAGE_NAME}
     hostname: ${CONTAINER_NAME}
     build:
@@ -24,11 +27,10 @@ services:
     privileged: ${PRIVILEGED:-false}
 
     volumes:
-      - ~/.zprofile:/root/.zprofile
+      - ~/.zprofile:/root/.zprofile # For PAT tokens mostly.
       - ${SSH_AUTH_SOCK}:/ssh-agent
       - .:/root/host
       - dev-vol:/root/workspace
-      - claude-vol:/root/.claude/projects
 
     environment:
       - SSH_AUTH_SOCK=/ssh-agent
