@@ -68,6 +68,8 @@ RUN apt install -y \
 RUN npm install -g @fsouza/prettierd
 RUN npm install -g prettier
 
+RUN npm install -g @anthropic-ai/claude-code
+
 # =============================================================================
 # Configs
 # =============================================================================
@@ -78,7 +80,7 @@ RUN echo "Busting Docker Cache with value: ${CACHE_BUSTER}"
 # Install dotfiles
 RUN --mount=type=ssh git clone --recursive git@github.com:mdavis36/configs.git dotfiles
 RUN cd dotfiles && \
-    stow --adopt zsh tmux git nvim && \
+    stow --adopt zsh tmux git nvim claude && \
     git restore .
 
 
