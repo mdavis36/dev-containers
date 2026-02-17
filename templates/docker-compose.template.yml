@@ -11,11 +11,14 @@ services:
       args:
         - BASE_IMG=${BASE_IMG}
         - CACHE_BUSTER=${CACHE_BUSTER:-1}
+        - HOST_USERNAME=${HOST_USERNAME:-dev}
+        - HOST_UID=${HOST_UID:-1000}
+        - HOST_GID=${HOST_GID:-1000}
       ssh:
         - default
 
     container_name: ${CONTAINER_NAME}
-    user: root
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
 
     # Resource limits (can be overridden in environment config)
     deploy:
@@ -27,16 +30,17 @@ services:
     privileged: ${PRIVILEGED:-false}
 
     volumes:
-      - ~/.zprofile:/root/.zprofile # For PAT tokens mostly.
+      - ~/.zprofile:${USER_HOME:-/home/dev}/.zprofile # For PAT tokens mostly.
       - ${SSH_AUTH_SOCK}:/ssh-agent
       - .:/host
-      - dev-vol:/root/workspace
+      - dev-vol:${USER_HOME:-/home/dev}/workspace
 
     environment:
       - SSH_AUTH_SOCK=/ssh-agent
 
-    command: sleep infinity
-    working_dir: /root/workspace
+    command: >
+      bash -c "sudo chown -R $(id -u):$(id -g) ~/workspace 2>/dev/null; exec sleep infinity"
+    working_dir: ${USER_HOME:-/home/dev}/workspace
 
 volumes:
   dev-vol:

@@ -9,6 +9,7 @@ import os
 import sys
 import subprocess
 import argparse
+import pwd
 from pathlib import Path
 from typing import Optional, Dict
 import yaml
@@ -101,7 +102,14 @@ class ContainerManager:
 
         if override_path.exists():
             with open(override_path) as f:
-                override_data = yaml.safe_load(f)
+                override_content = f.read()
+
+            # Apply same variable substitution to overrides
+            for key, value in config.items():
+                override_content = re.sub(rf'\${{{re.escape(key)}:-[^}}]+}}', value, override_content)
+                override_content = override_content.replace(f"${{{key}}}", value)
+
+            override_data = yaml.safe_load(override_content)
 
             # Deep merge override into compose_data
             compose_data = self._deep_merge(compose_data, override_data)
@@ -183,25 +191,33 @@ class ContainerManager:
 
         # Insert pre-template custom commands (Dockerfile.custom)
         if custom_content:
-            insertion_marker = "# ============================================================================="
-            ssh_section_marker = "# SSH & Basic Env"
+            # Insert custom content between the CUSTOM COMMANDS block and the USER switch.
+            # Custom commands run as root (before USER is set), so they can use apt directly.
+            user_switch_marker = "# Switch to non-root user for all tool installations"
 
-            parts = merged.split(f"{insertion_marker}\n{ssh_section_marker}")
+            parts = merged.split(user_switch_marker)
 
             if len(parts) == 2:
                 merged = (
-                    parts[0].split("RUN apt update")[0] +
-                    "RUN apt update\n\n" +
-                    custom_content +
-                    "\n\n" +
-                    insertion_marker + "\n" + ssh_section_marker +
+                    parts[0] +
+                    custom_content + "\n\n" +
+                    user_switch_marker +
                     parts[1]
                 )
             else:
-                merged = merged.replace(
-                    "RUN apt update",
-                    f"RUN apt update\n\n{custom_content}\n"
-                )
+                # Fallback: append before the SSH section
+                insertion_marker = "# ============================================================================="
+                ssh_section_marker = "# SSH & Basic Env"
+                parts = merged.split(f"{insertion_marker}\n{ssh_section_marker}")
+                if len(parts) == 2:
+                    merged = (
+                        parts[0] +
+                        custom_content + "\n\n" +
+                        insertion_marker + "\n" + ssh_section_marker +
+                        parts[1]
+                    )
+                else:
+                    merged = merged.rstrip() + "\n\n" + custom_content + "\n"
 
         # Append post-template commands (Dockerfile.post)
         if post_content:
@@ -309,26 +325,48 @@ class ContainerManager:
         print(f"Activating {file_label} container (env: {env_name})...")
 
         # Start SSH agent and add keys
-        try:
-            ssh_agent_output = subprocess.check_output(["ssh-agent", "-s"], text=True)
-            # Parse and set SSH_AUTH_SOCK and SSH_AGENT_PID
-            for line in ssh_agent_output.split('\n'):
-                if 'SSH_AUTH_SOCK' in line or 'SSH_AGENT_PID' in line:
-                    parts = line.split(';')[0].split('=')
-                    if len(parts) == 2:
-                        os.environ[parts[0]] = parts[1]
+        # If we're inside a container with an existing SSH agent socket (e.g. docker-dev),
+        # reuse it instead of starting a new one. A new agent's socket would live in the
+        # container's filesystem, invisible to the host Docker daemon for builds.
+        existing_sock = os.environ.get('SSH_AUTH_SOCK', '')
+        if existing_sock and Path(existing_sock).exists():
+            pass  # Reuse the existing agent
+        else:
+            try:
+                ssh_agent_output = subprocess.check_output(["ssh-agent", "-s"], text=True)
+                # Parse and set SSH_AUTH_SOCK and SSH_AGENT_PID
+                for line in ssh_agent_output.split('\n'):
+                    if 'SSH_AUTH_SOCK' in line or 'SSH_AGENT_PID' in line:
+                        parts = line.split(';')[0].split('=')
+                        if len(parts) == 2:
+                            os.environ[parts[0]] = parts[1]
 
-            # Add SSH key
-            ssh_key = Path.home() / ".ssh" / "id_ed25519"
-            if ssh_key.exists():
-                subprocess.run(["ssh-add", str(ssh_key)], check=False)
-        except Exception as e:
-            print(f"Warning: Failed to setup SSH agent: {e}")
+                # Add SSH key
+                ssh_key = Path.home() / ".ssh" / "id_ed25519"
+                if ssh_key.exists():
+                    subprocess.run(["ssh-add", str(ssh_key)], check=False)
+            except Exception as e:
+                print(f"Warning: Failed to setup SSH agent: {e}")
 
         # Set environment variables for docker-compose
-        config['SSH_AUTH_SOCK'] = os.environ.get('SSH_AUTH_SOCK', '')
+        # If HOST_SSH_AUTH_SOCK is set, we're inside a container (e.g. docker-dev) and
+        # need to use the original host path so the host Docker daemon can find the socket.
+        host_ssh_sock = os.environ.get('HOST_SSH_AUTH_SOCK', '')
+        config['SSH_AUTH_SOCK'] = host_ssh_sock if host_ssh_sock else os.environ.get('SSH_AUTH_SOCK', '')
         config['DOCKERFILE_PATH'] = self.get_dockerfile_path(env_name, instance_name)
         config['CACHE_BUSTER'] = str(subprocess.check_output(["date", "+%s"], text=True).strip())
+
+        # Inject host user info for non-root container user
+        host_user = pwd.getpwuid(os.getuid())
+        config.setdefault('HOST_USERNAME', host_user.pw_name)
+        config.setdefault('HOST_UID', str(host_user.pw_uid))
+        config.setdefault('HOST_GID', str(host_user.pw_gid))
+        config.setdefault('USER_HOME', f"/home/{config['HOST_USERNAME']}")
+
+        # Detect host Docker socket GID for Docker-in-Docker environments
+        docker_sock = Path("/var/run/docker.sock")
+        if docker_sock.exists():
+            config.setdefault('DOCKER_GID', str(docker_sock.stat().st_gid))
 
         # Generate docker-compose file
         compose_file = self.generate_compose_file(env_name, config, instance_name)
@@ -354,7 +392,7 @@ class ContainerManager:
             print("Container started successfully!")
 
         print("Entering container shell...")
-        subprocess.run(["docker", "exec", "-it", container_name, "zsh"])
+        subprocess.run(["docker", "exec", "-it", "-u", config['HOST_USERNAME'], container_name, "zsh", "--login"])
 
     def cmd_deactivate(self, env_name: str, instance_name: Optional[str] = None):
         """Stop a container environment"""
@@ -382,8 +420,9 @@ class ContainerManager:
             sys.exit(1)
 
         # Execute command or start shell
-        cmd = command if command else ["zsh"]
-        subprocess.run(["docker", "exec", "-it", container_name] + cmd)
+        cmd = command if command else ["zsh", "--login"]
+        host_username = pwd.getpwuid(os.getuid()).pw_name
+        subprocess.run(["docker", "exec", "-it", "-u", host_username, container_name] + cmd)
 
     def cmd_remove(self, env_name: str, instance_name: Optional[str] = None):
         """Remove container and cleanup"""

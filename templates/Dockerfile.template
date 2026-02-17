@@ -2,10 +2,25 @@ ARG BASE_IMG=ubuntu:24.04
 
 FROM ${BASE_IMG}
 
-WORKDIR /root
+# =============================================================================
+# Non-root User Setup
+# =============================================================================
+# Create a non-root user matching the host user's UID/GID for proper
+# file ownership on mounted volumes. Root access remains available via sudo.
+# =============================================================================
 
-# Update
-RUN apt update
+ARG HOST_USERNAME=dev
+ARG HOST_GID=1000
+ARG HOST_UID=1000
+
+# Update and install sudo first (as root)
+RUN apt update && apt install -y sudo \
+    && (groupadd --gid ${HOST_GID} ${HOST_USERNAME} 2>/dev/null || true) \
+    && (useradd --uid ${HOST_UID} --gid ${HOST_GID} -m -s /bin/zsh ${HOST_USERNAME} 2>/dev/null \
+        || (existing_user=$(getent passwd ${HOST_UID} | cut -d: -f1) \
+            && usermod -l ${HOST_USERNAME} -d /home/${HOST_USERNAME} -m -s /bin/zsh "$existing_user")) \
+    && echo "${HOST_USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${HOST_USERNAME} \
+    && chmod 0440 /etc/sudoers.d/${HOST_USERNAME}
 
 # =============================================================================
 # CUSTOM COMMANDS INSERTION POINT
@@ -19,23 +34,24 @@ RUN apt update
 # zsh, neovim, and other dev tools are installed.
 # =============================================================================
 
+# Switch to non-root user for all tool installations
+USER ${HOST_USERNAME}
+WORKDIR /home/${HOST_USERNAME}
+
 # =============================================================================
 # SSH & Basic Env
 # =============================================================================
 
-RUN apt install -y openssh-client git
+RUN sudo apt install -y openssh-client git
 
 # Add the Git provider's public key to known_hosts to avoid interactive prompts
-RUN mkdir -p -m 0600 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
 
-RUN apt install -y \
+RUN sudo apt install -y \
       zsh \
       zoxide \
       stow \
       tmux
-
-# Set zsh as default shell for root user
-RUN chsh -s /bin/zsh root
 
 # =============================================================================
 # Tools
@@ -45,16 +61,17 @@ RUN chsh -s /bin/zsh root
 RUN LAZYGIT_VERSION=0.59.0 && \
 curl -Lo lazygit.tar.gz "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_Linux_x86_64.tar.gz" && \
 tar xf lazygit.tar.gz lazygit && \
-install lazygit -D -t /usr/local/bin/
+sudo install lazygit -D -t /usr/local/bin/ && \
+rm -f lazygit.tar.gz lazygit
 
 # Install BOB Neovim Version Management
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV PATH="/home/${HOST_USERNAME}/.cargo/bin:/home/${HOST_USERNAME}/.local/bin:${PATH}"
 RUN cargo install bob-nvim
 RUN bob install 0.11.4
 
 # Install neovim dependencies
-RUN apt install -y \
+RUN sudo apt install -y \
       fzf \
       ripgrep \
       fd-find \
@@ -65,10 +82,10 @@ RUN apt install -y \
       npm \
       black
 
-RUN npm install -g @fsouza/prettierd
-RUN npm install -g prettier
+RUN sudo npm install -g @fsouza/prettierd
+RUN sudo npm install -g prettier
 
-RUN npm install -g @anthropic-ai/claude-code
+RUN sudo npm install -g @anthropic-ai/claude-code
 
 # =============================================================================
 # Configs
@@ -78,7 +95,7 @@ ARG CACHE_BUSTER=1
 RUN echo "Busting Docker Cache with value: ${CACHE_BUSTER}"
 
 # Install dotfiles
-RUN --mount=type=ssh git clone --recursive git@github.com:mdavis36/configs.git dotfiles
+RUN --mount=type=ssh,uid=${HOST_UID},gid=${HOST_GID} git clone --recursive git@github.com:mdavis36/configs.git dotfiles
 RUN cd dotfiles && \
     stow --adopt zsh tmux git nvim claude && \
     git restore .
@@ -87,7 +104,7 @@ RUN cd dotfiles && \
 # Set default shell for container
 SHELL ["/bin/zsh", "-c"]
 
-# Initialize and synv lazyvim plugins.
+# Initialize and sync lazyvim plugins.
 RUN nvim --headless "+Lazy! sync" +qa
 
 # =============================================================================
