@@ -248,6 +248,20 @@ class ContainerManager:
         with open(output_file, 'w') as f:
             f.write(merged)
 
+    def _get_dotfiles_commit(self) -> str:
+        """Get the latest commit hash of the dotfiles repo for cache busting."""
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", "git@github.com:mdavis36/configs.git", "HEAD"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.split()[0]
+        except Exception:
+            pass
+        # Fallback to timestamp if we can't reach the repo
+        return str(subprocess.check_output(["date", "+%s"], text=True).strip())
+
     def container_is_running(self, container_name: str) -> bool:
         """Check if container is running"""
         result = subprocess.run(
@@ -354,7 +368,7 @@ class ContainerManager:
         host_ssh_sock = os.environ.get('HOST_SSH_AUTH_SOCK', '')
         config['SSH_AUTH_SOCK'] = host_ssh_sock if host_ssh_sock else os.environ.get('SSH_AUTH_SOCK', '')
         config['DOCKERFILE_PATH'] = self.get_dockerfile_path(env_name, instance_name)
-        config['CACHE_BUSTER'] = str(subprocess.check_output(["date", "+%s"], text=True).strip())
+        config['CACHE_BUSTER'] = self._get_dotfiles_commit()
 
         # Inject host user info for non-root container user
         host_user = pwd.getpwuid(os.getuid())
