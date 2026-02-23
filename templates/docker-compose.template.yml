@@ -45,5 +45,3 @@ services:
 volumes:
   dev-vol:
     external: true
-  claude-vol:
-    external: true
