@@ -466,6 +466,81 @@ class ContainerManager:
 
         print("Container removed successfully!")
 
+    def cmd_generate(self, env_name: Optional[str] = None, all_envs: bool = False):
+        """Generate Dockerfile and compose file without building.
+        Useful for CI pipelines that handle the build step separately."""
+        if all_envs:
+            env_dir = self.config_dir / "environments"
+            if not env_dir.exists():
+                print(f"No environments found in {env_dir}")
+                sys.exit(1)
+            env_names = [p.name for p in sorted(env_dir.iterdir()) if p.is_dir() and (p / "config.env").exists()]
+        elif env_name:
+            env_names = [env_name]
+        else:
+            print("Error: provide an environment name or --all")
+            sys.exit(1)
+
+        for name in env_names:
+            config = self.load_environment_config(name)
+
+            # Provide CI-safe defaults for host-detected vars
+            config.setdefault('HOST_USERNAME', 'dev')
+            config.setdefault('HOST_UID', '1000')
+            config.setdefault('HOST_GID', '1000')
+            config.setdefault('USER_HOME', '/home/dev')
+            config.setdefault('SSH_AUTH_SOCK', '')
+            config.setdefault('CACHE_BUSTER', '1')
+            config['DOCKERFILE_PATH'] = self.get_dockerfile_path(name)
+
+            compose_path = self.generate_compose_file(name, config)
+            dockerfile_path = config['DOCKERFILE_PATH']
+
+            print(f"{name}:")
+            print(f"  Dockerfile:   {dockerfile_path}")
+            print(f"  Compose file: {compose_path.relative_to(self.project_root)}")
+
+    def cmd_build(self, env_name: str, push: bool = False, registry: Optional[str] = None, tags: Optional[list] = None):
+        """Build a container image, optionally push to a registry."""
+        config = self.load_environment_config(env_name)
+
+        # Provide CI-safe defaults for host-detected vars
+        config.setdefault('HOST_USERNAME', 'dev')
+        config.setdefault('HOST_UID', '1000')
+        config.setdefault('HOST_GID', '1000')
+        config.setdefault('USER_HOME', '/home/dev')
+        config.setdefault('SSH_AUTH_SOCK', '')
+        config.setdefault('CACHE_BUSTER', self._get_dotfiles_commit())
+        config['DOCKERFILE_PATH'] = self.get_dockerfile_path(env_name)
+
+        # Generate compose file
+        compose_file = self.generate_compose_file(env_name, config)
+
+        print(f"Building {env_name}...")
+        subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "build"],
+            cwd=self.project_root,
+            check=True,
+        )
+
+        image_name = config['IMAGE_NAME']
+
+        if push:
+            if not registry:
+                print("Error: --registry is required when using --push")
+                sys.exit(1)
+            if not tags:
+                tags = ["latest"]
+
+            for tag in tags:
+                remote_tag = f"{registry}/{env_name}:{tag}"
+                print(f"Tagging {image_name} -> {remote_tag}")
+                subprocess.run(["docker", "tag", image_name, remote_tag], check=True)
+                print(f"Pushing {remote_tag}...")
+                subprocess.run(["docker", "push", remote_tag], check=True)
+
+        print("Done.")
+
     def cmd_logs(self, env_name: str, follow: bool = False, tail: Optional[str] = None, instance_name: Optional[str] = None):
         """Show container logs"""
         config = self.load_environment_config(env_name, instance_name)
@@ -515,6 +590,18 @@ def main():
     remove_parser.add_argument('env_name', help='Environment name')
     remove_parser.add_argument('--name', dest='instance_name', help='Custom instance name')
 
+    # generate command
+    generate_parser = subparsers.add_parser('generate', help='Generate Dockerfile and compose file without building')
+    generate_parser.add_argument('env_name', nargs='?', help='Environment name')
+    generate_parser.add_argument('--all', dest='all_envs', action='store_true', help='Generate for all environments')
+
+    # build command
+    build_parser = subparsers.add_parser('build', help='Build a container image')
+    build_parser.add_argument('env_name', help='Environment name')
+    build_parser.add_argument('--push', action='store_true', help='Push image to registry after building')
+    build_parser.add_argument('--registry', help='Registry URL (required with --push)')
+    build_parser.add_argument('--tag', dest='tags', action='append', help='Image tag (can be specified multiple times, default: latest)')
+
     # logs command
     logs_parser = subparsers.add_parser('logs', help='Show container logs')
     logs_parser.add_argument('env_name', help='Environment name')
@@ -540,6 +627,10 @@ def main():
             manager.cmd_exec(args.env_name, args.command if args.command else None, args.instance_name)
         elif args.command == 'remove':
             manager.cmd_remove(args.env_name, args.instance_name)
+        elif args.command == 'generate':
+            manager.cmd_generate(args.env_name, args.all_envs)
+        elif args.command == 'build':
+            manager.cmd_build(args.env_name, args.push, args.registry, args.tags)
         elif args.command == 'logs':
             manager.cmd_logs(args.env_name, args.follow, args.tail, args.instance_name)
     except KeyboardInterrupt:
