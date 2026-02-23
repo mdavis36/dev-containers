@@ -466,9 +466,67 @@ class ContainerManager:
 
         print("Container removed successfully!")
 
-    def cmd_generate(self, env_name: Optional[str] = None, all_envs: bool = False):
+    def _transform_for_remote(self, compose_path: Path, env_name: str, registry: str, tag: str, build_mode: bool = False):
+        """Post-process a generated compose file for remote deployment.
+
+        Pull mode (default): Replace image with registry path, remove build section.
+        Build mode: Keep build section but rewrite paths for the remote host.
+        Both modes remove the .:/host volume mount.
+        """
+        with open(compose_path) as f:
+            data = yaml.safe_load(f)
+
+        service = data['services']['dev-env']
+
+        # Replace image with registry path
+        service['image'] = f"{registry}/{env_name}:{tag}"
+
+        if build_mode:
+            # Keep build section but rewrite paths for the remote host
+            build = service.get('build', {})
+            build['context'] = '/home/midavis'
+            build['dockerfile'] = f'/home/midavis/.Dockerfile.{env_name}'
+            service['build'] = build
+        else:
+            # Pull mode: remove build section entirely
+            service.pop('build', None)
+
+        # Remove volumes that don't apply on the remote cluster:
+        # - .:/host (nv-env project root isn't on the cluster)
+        # - ~/.zprofile:* (Docker daemon can't access NFS home dirs; docker cp instead)
+        # - *:/ssh-agent (SSH agent forwarding doesn't work across srun invocations;
+        #   copy SSH keys into the container via docker cp instead)
+        if 'volumes' in service:
+            fixed_volumes = []
+            for v in service['volumes']:
+                if not isinstance(v, str):
+                    fixed_volumes.append(v)
+                    continue
+                if v.startswith('.:/host'):
+                    continue
+                if v.startswith('~/.zprofile:'):
+                    continue
+                if v.endswith(':/ssh-agent'):
+                    continue
+                fixed_volumes.append(v)
+            service['volumes'] = fixed_volumes
+
+        # Remove SSH_AUTH_SOCK environment variable (no agent socket on cluster)
+        if 'environment' in service:
+            service['environment'] = [
+                e for e in service['environment']
+                if not (isinstance(e, str) and e.startswith('SSH_AUTH_SOCK='))
+            ]
+
+        with open(compose_path, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+    def cmd_generate(self, env_name: Optional[str] = None, all_envs: bool = False,
+                     remote: bool = False, registry: str = 'gitlab-master.nvidia.com:5005/midavis/nv-env',
+                     tag: str = 'latest', build_mode: bool = False):
         """Generate Dockerfile and compose file without building.
-        Useful for CI pipelines that handle the build step separately."""
+        Useful for CI pipelines that handle the build step separately.
+        With --remote, transforms the compose file for remote deployment."""
         if all_envs:
             env_dir = self.config_dir / "environments"
             if not env_dir.exists():
@@ -496,9 +554,18 @@ class ContainerManager:
             compose_path = self.generate_compose_file(name, config)
             dockerfile_path = config['DOCKERFILE_PATH']
 
-            print(f"{name}:")
-            print(f"  Dockerfile:   {dockerfile_path}")
-            print(f"  Compose file: {compose_path.relative_to(self.project_root)}")
+            if remote:
+                self._transform_for_remote(compose_path, name, registry, tag, build_mode)
+                mode_label = "build" if build_mode else "pull"
+                print(f"{name} (remote/{mode_label}):")
+                print(f"  Compose file: {compose_path.relative_to(self.project_root)}")
+                print(f"  Image:        {registry}/{name}:{tag}")
+                if build_mode:
+                    print(f"  Dockerfile:   {dockerfile_path}")
+            else:
+                print(f"{name}:")
+                print(f"  Dockerfile:   {dockerfile_path}")
+                print(f"  Compose file: {compose_path.relative_to(self.project_root)}")
 
     def cmd_build(self, env_name: str, push: bool = False, registry: Optional[str] = None, tags: Optional[list] = None):
         """Build a container image, optionally push to a registry."""
@@ -594,6 +661,10 @@ def main():
     generate_parser = subparsers.add_parser('generate', help='Generate Dockerfile and compose file without building')
     generate_parser.add_argument('env_name', nargs='?', help='Environment name')
     generate_parser.add_argument('--all', dest='all_envs', action='store_true', help='Generate for all environments')
+    generate_parser.add_argument('--remote', action='store_true', help='Transform compose file for remote deployment (pull mode by default)')
+    generate_parser.add_argument('--registry', default='gitlab-master.nvidia.com:5005/midavis/nv-env', help='Container registry URL (default: gitlab-master.nvidia.com:5005/midavis/nv-env)')
+    generate_parser.add_argument('--tag', default='latest', help='Image tag (default: latest)')
+    generate_parser.add_argument('--build', dest='build_mode', action='store_true', help='Remote build mode: keep build section with rewritten paths')
 
     # build command
     build_parser = subparsers.add_parser('build', help='Build a container image')
@@ -628,7 +699,7 @@ def main():
         elif args.command == 'remove':
             manager.cmd_remove(args.env_name, args.instance_name)
         elif args.command == 'generate':
-            manager.cmd_generate(args.env_name, args.all_envs)
+            manager.cmd_generate(args.env_name, args.all_envs, args.remote, args.registry, args.tag, args.build_mode)
         elif args.command == 'build':
             manager.cmd_build(args.env_name, args.push, args.registry, args.tags)
         elif args.command == 'logs':
