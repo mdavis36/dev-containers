@@ -622,6 +622,64 @@ class ContainerManager:
 
         subprocess.run(cmd)
 
+    def _srun_ssh(self, job_id: str, command: str, check: bool = True) -> subprocess.CompletedProcess:
+        """Run a command on dlcluster via srun against a Slurm job allocation."""
+        return subprocess.run(
+            ["ssh", "midavis@dlcluster", f"srun --jobid={job_id} {command}"],
+            check=check
+        )
+
+    def cmd_deploy(self, env_name: str, job_id: str, tag: str = 'latest',
+                   registry: str = 'gitlab-master.nvidia.com:5005/midavis/nv-env',
+                   skip_setup: bool = False):
+        """Deploy a container to dlcluster: SCP compose, pull, start, inject files."""
+        config = self.load_environment_config(env_name)
+        container_name = config['CONTAINER_NAME']
+        compose_filename = f".docker-compose.{env_name}.yml"
+        local_compose = self.project_root / compose_filename
+        remote_compose = f"/home/midavis/{compose_filename}"
+
+        if not local_compose.exists():
+            print(f"Error: {compose_filename} not found. Run 'container generate {env_name} --remote' first.")
+            sys.exit(1)
+
+        # 1. SCP compose file to cluster
+        print(f"Copying {compose_filename} to dlcluster...")
+        subprocess.run(["scp", str(local_compose), f"midavis@dlcluster:/home/midavis/"], check=True)
+
+        # 2. One-time setup (idempotent — volume create is a no-op if it exists)
+        if not skip_setup:
+            print("Ensuring dev-vol exists...")
+            self._srun_ssh(job_id, "docker volume create dev-vol", check=False)
+
+        # 3. Pull and start
+        print(f"Pulling {registry}/{env_name}:{tag}...")
+        self._srun_ssh(job_id, f"docker compose -f {remote_compose} pull")
+        print("Starting container...")
+        self._srun_ssh(job_id, f"docker compose -f {remote_compose} up -d")
+
+        # 4. Inject SSH key via docker cp through /tmp
+        print("Injecting SSH key...")
+        self._srun_ssh(job_id,
+            f"bash -c 'cp ~/.ssh/id_ed25519 /tmp/id_ed25519 && "
+            f"docker cp /tmp/id_ed25519 {container_name}:/home/dev/.ssh/id_ed25519 && "
+            f"rm /tmp/id_ed25519'")
+        self._srun_ssh(job_id,
+            f"docker exec -u root {container_name} bash -c "
+            f"'chown 1000:1000 /home/dev/.ssh/id_ed25519 && chmod 600 /home/dev/.ssh/id_ed25519'")
+
+        # 5. Inject .zprofile via docker cp through /tmp
+        print("Injecting .zprofile...")
+        self._srun_ssh(job_id,
+            f"bash -c 'cp ~/.zprofile /tmp/.zprofile && "
+            f"docker cp /tmp/.zprofile {container_name}:/home/dev/.zprofile && "
+            f"rm /tmp/.zprofile'")
+
+        print(f"\nContainer {container_name} is running on job {job_id}.")
+        print(f"  Exec:    ssh midavis@dlcluster \"srun --jobid={job_id} docker exec {container_name} <cmd>\"")
+        print(f"  Shell:   tmux new-window -n dlcluster \\; send-keys "
+              f"\"ssh -t midavis@dlcluster 'srun --pty --jobid={job_id} docker exec -it {container_name} zsh'\" Enter")
+
 
 def main():
     manager = ContainerManager()
@@ -680,6 +738,14 @@ def main():
     logs_parser.add_argument('-f', '--follow', action='store_true', help='Follow log output')
     logs_parser.add_argument('--tail', help='Number of lines to show from the end')
 
+    # deploy command
+    deploy_parser = subparsers.add_parser('deploy', help='Deploy container to dlcluster via Slurm job')
+    deploy_parser.add_argument('env_name', help='Environment name')
+    deploy_parser.add_argument('--job-id', required=True, help='Slurm job ID from sbatch')
+    deploy_parser.add_argument('--tag', default='latest', help='Image tag (default: latest)')
+    deploy_parser.add_argument('--registry', default='gitlab-master.nvidia.com:5005/midavis/nv-env')
+    deploy_parser.add_argument('--skip-setup', action='store_true', help='Skip volume creation')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -704,6 +770,8 @@ def main():
             manager.cmd_build(args.env_name, args.push, args.registry, args.tags)
         elif args.command == 'logs':
             manager.cmd_logs(args.env_name, args.follow, args.tail, args.instance_name)
+        elif args.command == 'deploy':
+            manager.cmd_deploy(args.env_name, args.job_id, args.tag, args.registry, args.skip_setup)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
         sys.exit(130)
