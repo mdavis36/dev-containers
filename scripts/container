@@ -493,7 +493,7 @@ class ContainerManager:
 
         # Remove volumes that don't apply on the remote cluster:
         # - .:/host (nv-env project root isn't on the cluster)
-        # - ~/.zprofile:* (Docker daemon can't access NFS home dirs; docker cp instead)
+        # - ~/.secrets:* (Docker daemon can't access NFS home dirs; docker cp instead)
         # - *:/ssh-agent (SSH agent forwarding doesn't work across srun invocations;
         #   copy SSH keys into the container via docker cp instead)
         if 'volumes' in service:
@@ -504,7 +504,7 @@ class ContainerManager:
                     continue
                 if v.startswith('.:/host'):
                     continue
-                if v.startswith('~/.zprofile:'):
+                if v.startswith('~/.secrets:'):
                     continue
                 if v.endswith(':/ssh-agent'):
                     continue
@@ -668,12 +668,12 @@ class ContainerManager:
             f"docker exec -u root {container_name} bash -c "
             f"'chown 1000:1000 /home/dev/.ssh/id_ed25519 && chmod 600 /home/dev/.ssh/id_ed25519'")
 
-        # 5. Inject .zprofile via docker cp through /tmp
-        print("Injecting .zprofile...")
+        # 5. Inject .secrets via docker cp through /tmp
+        print("Injecting .secrets...")
         self._srun_ssh(job_id,
-            f"bash -c 'cp ~/.zprofile /tmp/.zprofile && "
-            f"docker cp /tmp/.zprofile {container_name}:/home/dev/.zprofile && "
-            f"rm /tmp/.zprofile'")
+            f"bash -c 'cp ~/.secrets /tmp/.secrets && "
+            f"docker cp /tmp/.secrets {container_name}:/home/dev/.secrets && "
+            f"rm /tmp/.secrets'")
 
         print(f"\nContainer {container_name} is running on job {job_id}.")
         print(f"  Exec:    ssh midavis@dlcluster \"srun --jobid={job_id} docker exec {container_name} <cmd>\"")
