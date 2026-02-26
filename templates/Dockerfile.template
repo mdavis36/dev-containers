@@ -51,7 +51,8 @@ RUN sudo apt install -y \
       zsh \
       zoxide \
       stow \
-      tmux
+      tmux \
+      gh
 
 # =============================================================================
 # Tools
