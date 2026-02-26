@@ -30,7 +30,7 @@ services:
     privileged: ${PRIVILEGED:-false}
 
     volumes:
-      - ~/.zprofile:${USER_HOME:-/home/dev}/.zprofile # For PAT tokens mostly.
+      - ~/.secrets:${USER_HOME:-/home/dev}/.secrets # For PAT tokens mostly.
       - ${SSH_AUTH_SOCK}:/ssh-agent
       - .:/host
       - dev-vol:${USER_HOME:-/home/dev}/workspace
